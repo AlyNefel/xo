@@ -33,7 +33,12 @@ let gameActive = false;
 btnJoin.addEventListener('click', joinGame);
 btnRejoin.addEventListener('click', () => {
     disconnectOverlay.classList.remove('active');
-    nicknameOverlay.classList.add('active');
+    const nickname = nicknameInput.value.trim();
+    if (nickname.length > 0) {
+        socket.emit('join_game', nickname);
+    } else {
+        nicknameOverlay.classList.add('active');
+    }
 });
 
 cells.forEach(cell => cell.addEventListener('click', cellClicked));
@@ -77,6 +82,9 @@ socket.on('opponent_moved', (data) => {
 
 socket.on('opponent_disconnected', () => {
     gameActive = false;
+    disconnectOverlay.querySelector('h2').textContent = "Opponent Disconnected";
+    disconnectOverlay.querySelector('h2').className = "mb-4 fw-bold text-danger";
+    disconnectOverlay.querySelector('p').textContent = "The other player has left the game.";
     disconnectOverlay.classList.add('active');
     resetBoard();
 });
@@ -146,6 +154,7 @@ function checkWinner() {
         // Show rejoin option after 3 seconds
         setTimeout(() => {
             disconnectOverlay.querySelector('h2').textContent = "Game Over";
+            disconnectOverlay.querySelector('h2').className = "mb-4 fw-bold";
             disconnectOverlay.querySelector('p').textContent = (currentPlayer === myRole) ? "Victory!" : "Defeat!";
             disconnectOverlay.classList.add('active');
             resetBoard();
@@ -157,6 +166,7 @@ function checkWinner() {
         
         setTimeout(() => {
             disconnectOverlay.querySelector('h2').textContent = "Game Over";
+            disconnectOverlay.querySelector('h2').className = "mb-4 fw-bold";
             disconnectOverlay.querySelector('p').textContent = "It was a tie!";
             disconnectOverlay.classList.add('active');
             resetBoard();
