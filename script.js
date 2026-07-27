@@ -1,14 +1,22 @@
+const socket = io();
+
+// UI Elements
+const nicknameOverlay = document.getElementById('nickname-overlay');
+const nicknameInput = document.getElementById('nickname-input');
+const btnJoin = document.getElementById('btn-join');
+
+const waitingOverlay = document.getElementById('waiting-overlay');
+const disconnectOverlay = document.getElementById('disconnect-overlay');
+const btnRejoin = document.getElementById('btn-rejoin');
+
 const cells = document.querySelectorAll('.cell');
 const statusText = document.querySelector('#turn-text');
-const restartBtn = document.querySelector('#btn-restart');
 const winningLine = document.querySelector('#winning-line');
-const pvpBtn = document.querySelector('#btn-pvp');
-const pvaBtn = document.querySelector('#btn-pva');
 
-const scoreXElement = document.getElementById('score-x');
-const scoreOElement = document.getElementById('score-o');
-const scoreTieElement = document.getElementById('score-tie');
+const nameX = document.getElementById('name-x');
+const nameO = document.getElementById('name-o');
 
+// Game State
 const winConditions = [
     [0, 1, 2], [3, 4, 5], [6, 7, 8], // Rows
     [0, 3, 6], [1, 4, 7], [2, 5, 8], // Columns
@@ -17,74 +25,94 @@ const winConditions = [
 
 let options = ["", "", "", "", "", "", "", "", ""];
 let currentPlayer = "X";
-let running = false;
-let isBotMode = false;
-let scores = { X: 0, O: 0, Tie: 0 };
-let botThinking = false;
+let myRole = null; // 'X' or 'O'
+let isMyTurn = false;
+let gameActive = false;
 
-initializeGame();
+// Initialization
+btnJoin.addEventListener('click', joinGame);
+btnRejoin.addEventListener('click', () => {
+    disconnectOverlay.classList.remove('active');
+    nicknameOverlay.classList.add('active');
+});
 
-function initializeGame() {
-    cells.forEach(cell => cell.addEventListener('click', cellClicked));
-    restartBtn.addEventListener('click', restartGame);
-    
-    pvpBtn.addEventListener('click', () => setMode(false));
-    pvaBtn.addEventListener('click', () => setMode(true));
+cells.forEach(cell => cell.addEventListener('click', cellClicked));
 
-    running = true;
-    updateStatusText();
-}
-
-function setMode(botMode) {
-    if (botMode === isBotMode) return;
-    
-    isBotMode = botMode;
-    if (isBotMode) {
-        pvaBtn.classList.add('active');
-        pvpBtn.classList.remove('active');
-    } else {
-        pvpBtn.classList.add('active');
-        pvaBtn.classList.remove('active');
+function joinGame() {
+    const nickname = nicknameInput.value.trim();
+    if (nickname.length > 0) {
+        nicknameOverlay.classList.remove('active');
+        socket.emit('join_game', nickname);
     }
-    
-    scores = { X: 0, O: 0, Tie: 0 };
-    updateScoreBoard();
-    restartGame();
 }
 
+// Socket Events
+socket.on('waiting_for_opponent', () => {
+    waitingOverlay.classList.add('active');
+});
+
+socket.on('role_assigned', (role) => {
+    myRole = role;
+});
+
+socket.on('game_start', (data) => {
+    waitingOverlay.classList.remove('active');
+    
+    nameX.textContent = `${data.playerX} (X)`;
+    nameO.textContent = `${data.playerO} (O)`;
+    
+    currentPlayer = data.startingTurn;
+    isMyTurn = (myRole === currentPlayer);
+    gameActive = true;
+    
+    updateStatusText();
+});
+
+socket.on('opponent_moved', (data) => {
+    // data: { index, player }
+    const cell = cells[data.index];
+    updateCell(cell, data.index, data.player);
+    checkWinner();
+});
+
+socket.on('opponent_disconnected', () => {
+    gameActive = false;
+    disconnectOverlay.classList.add('active');
+    resetBoard();
+});
+
+// Game Logic
 function cellClicked(e) {
-    if (botThinking || !running) return;
+    if (!gameActive || !isMyTurn) return;
 
     const cell = e.target;
     const cellIndex = cell.getAttribute('data-index');
 
-    if (options[cellIndex] != "" || !running) return;
+    if (options[cellIndex] !== "") return;
 
-    updateCell(cell, cellIndex);
+    // Make move
+    updateCell(cell, cellIndex, myRole);
+    socket.emit('make_move', { index: cellIndex, player: myRole });
     checkWinner();
-
-    if (running && isBotMode && currentPlayer === "O") {
-        botThinking = true;
-        setTimeout(botMove, 500); // Slight delay for realism
-    }
 }
 
-function updateCell(cell, index) {
-    options[index] = currentPlayer;
-    cell.textContent = currentPlayer;
-    cell.classList.add('taken', currentPlayer.toLowerCase());
+function updateCell(cell, index, player) {
+    options[index] = player;
+    cell.textContent = player;
+    cell.classList.add('taken', player.toLowerCase());
 }
 
 function changePlayer() {
     currentPlayer = (currentPlayer === "X") ? "O" : "X";
+    isMyTurn = (myRole === currentPlayer);
     updateStatusText();
 }
 
 function updateStatusText() {
-    if (currentPlayer === "X") {
-        statusText.innerHTML = `Player <span class="x-text">X</span>'s Turn`;
+    if (isMyTurn) {
+        statusText.innerHTML = `Your Turn (<span class="${myRole.toLowerCase()}-text">${myRole}</span>)`;
     } else {
-        statusText.innerHTML = `Player <span class="o-text">O</span>'s Turn`;
+        statusText.innerHTML = `Opponent's Turn...`;
     }
 }
 
@@ -98,10 +126,10 @@ function checkWinner() {
         const cellB = options[condition[1]];
         const cellC = options[condition[2]];
 
-        if (cellA == "" || cellB == "" || cellC == "") {
+        if (cellA === "" || cellB === "" || cellC === "") {
             continue;
         }
-        if (cellA == cellB && cellB == cellC) {
+        if (cellA === cellB && cellB === cellC) {
             roundWon = true;
             winningCondition = condition;
             break;
@@ -109,18 +137,30 @@ function checkWinner() {
     }
 
     if (roundWon) {
-        let winnerText = currentPlayer === "X" ? `<span class="x-text">X</span> Wins!` : `<span class="o-text">O</span> Wins!`;
+        let winnerText = (currentPlayer === myRole) ? `You Win! 🎉` : `You Lose! 😢`;
         statusText.innerHTML = winnerText;
-        running = false;
-        scores[currentPlayer]++;
-        updateScoreBoard();
+        gameActive = false;
         drawWinningLine(winningCondition);
         highlightCells(winningCondition);
+        
+        // Show rejoin option after 3 seconds
+        setTimeout(() => {
+            disconnectOverlay.querySelector('h2').textContent = "Game Over";
+            disconnectOverlay.querySelector('p').textContent = (currentPlayer === myRole) ? "Victory!" : "Defeat!";
+            disconnectOverlay.classList.add('active');
+            resetBoard();
+        }, 3000);
+
     } else if (!options.includes("")) {
         statusText.innerHTML = `It's a <span class="text-white">Draw!</span>`;
-        running = false;
-        scores.Tie++;
-        updateScoreBoard();
+        gameActive = false;
+        
+        setTimeout(() => {
+            disconnectOverlay.querySelector('h2').textContent = "Game Over";
+            disconnectOverlay.querySelector('p').textContent = "It was a tie!";
+            disconnectOverlay.classList.add('active');
+            resetBoard();
+        }, 3000);
     } else {
         changePlayer();
     }
@@ -130,7 +170,6 @@ function drawWinningLine(condition) {
     const startCell = cells[condition[0]];
     const endCell = cells[condition[2]];
     
-    // Get positions relative to the board
     const boardRect = document.getElementById('board').getBoundingClientRect();
     const startRect = startCell.getBoundingClientRect();
     const endRect = endCell.getBoundingClientRect();
@@ -143,10 +182,9 @@ function drawWinningLine(condition) {
     const length = Math.sqrt(Math.pow(endX - startX, 2) + Math.pow(endY - startY, 2));
     const angle = Math.atan2(endY - startY, endX - startX) * 180 / Math.PI;
 
-    // We add a little padding so the line doesn't start exactly at the center
     const thickness = 6;
     
-    winningLine.style.width = '0px'; // Start at 0 for animation
+    winningLine.style.width = '0px';
     winningLine.style.height = `${thickness}px`;
     winningLine.style.top = `${startY - thickness / 2}px`;
     winningLine.style.left = `${startX}px`;
@@ -156,7 +194,6 @@ function drawWinningLine(condition) {
     
     winningLine.classList.add('active');
     
-    // Animate
     setTimeout(() => {
         winningLine.style.width = `${length}px`;
     }, 50);
@@ -168,113 +205,12 @@ function highlightCells(condition) {
     });
 }
 
-function updateScoreBoard() {
-    scoreXElement.textContent = scores.X;
-    scoreOElement.textContent = scores.O;
-    scoreTieElement.textContent = scores.Tie;
-}
-
-function restartGame() {
-    currentPlayer = "X";
+function resetBoard() {
     options = ["", "", "", "", "", "", "", "", ""];
-    updateStatusText();
-    
-    winningLine.classList.remove('active');
-    winningLine.style.width = '0px';
-
     cells.forEach(cell => {
         cell.textContent = "";
         cell.classList.remove('taken', 'x', 'o', 'win-anim');
     });
-    
-    running = true;
-    botThinking = false;
-}
-
-
-/* ===========================
-   BOT LOGIC (Minimax)
-=========================== */
-
-function botMove() {
-    if (!running) return;
-
-    let bestScore = -Infinity;
-    let move = -1;
-
-    for (let i = 0; i < options.length; i++) {
-        if (options[i] === "") {
-            options[i] = "O";
-            let score = minimax(options, 0, false);
-            options[i] = "";
-            
-            // To add a little bit of randomness to prevent identical boring games all the time
-            // We can occasionally pick a sub-optimal move or just randomize if multiple best scores.
-            // But Minimax guarantees no-loss. We'll stick to strict Minimax for unbeatable.
-            if (score > bestScore) {
-                bestScore = score;
-                move = i;
-            } else if (score === bestScore && Math.random() < 0.5) {
-                // Randomize between equal best moves
-                move = i;
-            }
-        }
-    }
-
-    if (move !== -1) {
-        const cell = cells[move];
-        updateCell(cell, move);
-        checkWinner();
-    }
-    botThinking = false;
-}
-
-let minimaxScores = {
-    X: -10,
-    O: 10,
-    Tie: 0
-};
-
-function minimax(board, depth, isMaximizing) {
-    let result = checkWinCondition(board);
-    if (result !== null) {
-        return minimaxScores[result];
-    }
-
-    if (isMaximizing) {
-        let bestScore = -Infinity;
-        for (let i = 0; i < board.length; i++) {
-            if (board[i] === "") {
-                board[i] = "O";
-                let score = minimax(board, depth + 1, false);
-                board[i] = "";
-                bestScore = Math.max(score, bestScore);
-            }
-        }
-        return bestScore;
-    } else {
-        let bestScore = Infinity;
-        for (let i = 0; i < board.length; i++) {
-            if (board[i] === "") {
-                board[i] = "X";
-                let score = minimax(board, depth + 1, true);
-                board[i] = "";
-                bestScore = Math.min(score, bestScore);
-            }
-        }
-        return bestScore;
-    }
-}
-
-function checkWinCondition(board) {
-    for (let i = 0; i < winConditions.length; i++) {
-        const [a, b, c] = winConditions[i];
-        if (board[a] && board[a] === board[b] && board[a] === board[c]) {
-            return board[a]; // 'X' or 'O'
-        }
-    }
-    if (!board.includes("")) {
-        return "Tie";
-    }
-    return null;
+    winningLine.classList.remove('active');
+    winningLine.style.width = '0px';
 }
