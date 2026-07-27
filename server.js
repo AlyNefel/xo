@@ -17,6 +17,17 @@ io.on('connection', (socket) => {
     socket.on('join_game', (nickname) => {
         socket.nickname = nickname;
 
+        // Clean up previous room if any
+        if (socket.room) {
+            socket.leave(socket.room);
+            socket.room = null;
+        }
+
+        if (waitingPlayer === socket) {
+            // Already waiting
+            return;
+        }
+
         if (waitingPlayer) {
             // Match found!
             const player1 = waitingPlayer;
