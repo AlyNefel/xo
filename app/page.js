@@ -8,267 +8,310 @@ const WIN_CONDITIONS = [
   [0, 4, 8], [2, 4, 6]
 ];
 
+const LOBBY_TOPIC = 'xo-game-lobby-v3';
+const BROKER_URL  = 'wss://broker.emqx.io:8084/mqtt';
+
 export default function Game() {
-  const [client, setClient] = useState(null);
-  const [clientId, setClientId] = useState('');
-  
-  // UI States
-  const [nickname, setNickname] = useState('');
-  const [overlayState, setOverlayState] = useState('nickname'); // nickname, waiting, disconnect, none
-  
-  // Game States
-  const [board, setBoard] = useState(Array(9).fill(""));
-  const [currentPlayer, setCurrentPlayer] = useState("X");
-  const [myRole, setMyRole] = useState(null); // 'X' or 'O'
-  const [gameActive, setGameActive] = useState(false);
-  const [players, setPlayers] = useState({ X: 'Player X', O: 'Player O' });
-  const [winningLine, setWinningLine] = useState(null);
-  const [gameOverText, setGameOverText] = useState({ title: '', desc: '', className: '' });
-  
-  const [roomId, setRoomId] = useState(null);
+  // --- Refs (stable across renders, no re-subscribe cycles) ---
+  const clientRef      = useRef(null);
+  const clientIdRef    = useRef('');
+  const nicknameRef    = useRef('');
+  const overlayRef     = useRef('nickname');
+  const myRoleRef      = useRef(null);
+  const roomIdRef      = useRef(null);
+  const boardRef       = useRef(Array(9).fill(''));
+  const currentTurnRef = useRef('X');
+  const gameActiveRef  = useRef(false);
+  const intervalRef    = useRef(null);
+  const boardDomRef    = useRef(null);
+  const cellRefs       = useRef([]);
+  const matchedRef     = useRef(false);  // prevent double-matching
 
-  const boardRef = useRef(null);
-  const cellRefs = useRef([]);
+  // --- React state (only for re-renders) ---
+  const [overlayState,  setOverlayState]  = useState('nickname');
+  const [nicknameInput, setNicknameInput] = useState('');
+  const [players,       setPlayers]       = useState({ X: 'Player X', O: 'Player O' });
+  const [boardView,     setBoardView]     = useState(Array(9).fill(''));
+  const [currentPlayer, setCurrentPlayer] = useState('X');
+  const [winningLine,   setWinningLine]   = useState(null);
+  const [gameOverText,  setGameOverText]  = useState({ title: '', desc: '', className: '' });
+  const [connected,     setConnected]     = useState(false);
 
-  // Connect to MQTT Broker on load
+  // --- Connect MQTT once ---
   useEffect(() => {
-    const id = 'xo_player_' + Math.random().toString(16).substring(2, 10);
-    setClientId(id);
+    const id = 'xo_' + Math.random().toString(16).substring(2, 12);
+    clientIdRef.current = id;
 
-    // Free public MQTT broker over WebSockets
-    const mqttClient = mqtt.connect('wss://broker.emqx.io:8084/mqtt', {
+    const mqttClient = mqtt.connect(BROKER_URL, {
       clientId: id,
       clean: true,
-      connectTimeout: 4000,
-      reconnectPeriod: 1000,
+      connectTimeout: 6000,
+      reconnectPeriod: 2000,
     });
 
     mqttClient.on('connect', () => {
-      console.log('Connected to MQTT');
-      mqttClient.subscribe('xo-lobby-global-v1');
+      console.log('MQTT connected:', id);
+      mqttClient.subscribe(LOBBY_TOPIC);
+      setConnected(true);
     });
 
-    setClient(mqttClient);
+    mqttClient.on('message', handleMessage);
+
+    mqttClient.on('disconnect', () => setConnected(false));
+
+    clientRef.current = mqttClient;
 
     return () => {
+      stopLooking();
       mqttClient.end();
     };
   }, []);
 
-  // Handle incoming messages
-  useEffect(() => {
-    if (!client) return;
+  // -------------------------------------------------------
+  // MATCHMAKING
+  // -------------------------------------------------------
+  function startLooking() {
+    matchedRef.current = false;
+    broadcastFindMatch();
+    intervalRef.current = setInterval(broadcastFindMatch, 2500);
+  }
 
-    const handleMessage = (topic, message) => {
-      const data = JSON.parse(message.toString());
-      
-      if (topic === 'xo-lobby-global-v1') {
-        // I am waiting for a match, someone else wants to play
-        if (data.type === 'FIND_MATCH' && data.id !== clientId && overlayState === 'waiting') {
-          // I will be the Host
-          const newRoomId = 'xo_room_' + Math.random().toString(16).substring(2, 10);
-          client.subscribe(newRoomId);
-          client.publish('xo-lobby-global-v1', JSON.stringify({
-            type: 'MATCH_FOUND',
-            hostId: clientId,
-            guestId: data.id,
-            roomId: newRoomId,
-            hostNickname: nickname
-          }));
-        }
-        
-        // Someone found a match for me (I am the Guest)
-        if (data.type === 'MATCH_FOUND' && data.guestId === clientId && overlayState === 'waiting') {
-          client.subscribe(data.roomId);
-          setRoomId(data.roomId);
-          setMyRole('O');
-          setPlayers({ X: data.hostNickname, O: nickname });
-          setOverlayState('none');
-          setGameActive(true);
-          resetBoardState();
-          
-          client.publish(data.roomId, JSON.stringify({
-            type: 'GAME_START',
-            guestNickname: nickname
-          }));
-        }
-      }
-
-      // Room-specific messages
-      if (topic === roomId) {
-        if (data.type === 'GAME_START' && myRole === 'X') {
-          setPlayers(prev => ({ ...prev, O: data.guestNickname }));
-          setOverlayState('none');
-          setGameActive(true);
-          resetBoardState();
-        }
-
-        if (data.type === 'MOVE' && data.player !== myRole) {
-          handleMove(data.index, data.player, false);
-        }
-
-        if (data.type === 'LEAVE' && data.player !== myRole) {
-          handleOpponentDisconnect();
-        }
-      }
-    };
-
-    client.on('message', handleMessage);
-    return () => client.removeListener('message', handleMessage);
-  }, [client, clientId, overlayState, nickname, roomId, myRole]);
-
-  const handleOpponentDisconnect = () => {
-    setGameActive(false);
-    setGameOverText({
-      title: "Opponent Disconnected",
-      desc: "The other player has left the game.",
-      className: "mb-4 fw-bold text-danger"
-    });
-    setOverlayState('disconnect');
-    resetBoardState();
-    if (client && roomId) {
-      client.unsubscribe(roomId);
-      setRoomId(null);
+  function stopLooking() {
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
     }
-  };
+  }
 
-  const resetBoardState = () => {
-    setBoard(Array(9).fill(""));
+  function broadcastFindMatch() {
+    if (!clientRef.current || matchedRef.current) return;
+    clientRef.current.publish(LOBBY_TOPIC, JSON.stringify({
+      type: 'FIND_MATCH',
+      id:   clientIdRef.current,
+      nick: nicknameRef.current,
+    }));
+  }
+
+  // -------------------------------------------------------
+  // MESSAGE HANDLER (stable ref – registered once)
+  // -------------------------------------------------------
+  function handleMessage(topic, rawMsg) {
+    let data;
+    try { data = JSON.parse(rawMsg.toString()); } catch { return; }
+
+    // ---- LOBBY ----
+    if (topic === LOBBY_TOPIC) {
+
+      if (data.type === 'FIND_MATCH' && data.id !== clientIdRef.current && overlayRef.current === 'waiting') {
+        // Deterministic host selection: alphabetically higher ID = host (X)
+        const iAmHost = clientIdRef.current > data.id;
+        if (!iAmHost) return; // guest side: wait for host to declare MATCH_FOUND
+
+        if (matchedRef.current) return;
+        matchedRef.current = true;
+        stopLooking();
+
+        const newRoomId = 'xo_room_' + Math.random().toString(16).substring(2, 10);
+        roomIdRef.current = newRoomId;
+        clientRef.current.subscribe(newRoomId);
+
+        // Tell both players (including myself via lobby echo)
+        clientRef.current.publish(LOBBY_TOPIC, JSON.stringify({
+          type: 'MATCH_FOUND',
+          hostId:   clientIdRef.current,
+          guestId:  data.id,
+          roomId:   newRoomId,
+          hostNick: nicknameRef.current,
+          guestNick: data.nick,
+        }));
+      }
+
+      if (data.type === 'MATCH_FOUND') {
+        const amHost  = data.hostId  === clientIdRef.current;
+        const amGuest = data.guestId === clientIdRef.current;
+        if ((!amHost && !amGuest) || matchedRef.current) return;
+
+        matchedRef.current = true;
+        stopLooking();
+
+        const role = amHost ? 'X' : 'O';
+        myRoleRef.current  = role;
+        roomIdRef.current  = data.roomId;
+
+        clientRef.current.subscribe(data.roomId);
+        setPlayers({ X: data.hostNick, O: data.guestNick });
+        setOverlayState('none');
+        overlayRef.current = 'none';
+        resetBoardState();
+        gameActiveRef.current = true;
+      }
+    }
+
+    // ---- ROOM ----
+    if (topic === roomIdRef.current) {
+      if (data.type === 'MOVE' && data.player !== myRoleRef.current && gameActiveRef.current) {
+        applyMove(data.index, data.player);
+      }
+
+      if (data.type === 'LEAVE') {
+        gameActiveRef.current = false;
+        setGameOverText({
+          title: 'Opponent Disconnected',
+          desc:  'The other player has left the game.',
+          className: 'mb-4 fw-bold text-danger',
+        });
+        setOverlayState('disconnect');
+        overlayRef.current = 'disconnect';
+        resetBoardState();
+      }
+    }
+  }
+
+  // -------------------------------------------------------
+  // BOARD LOGIC
+  // -------------------------------------------------------
+  function resetBoardState() {
+    boardRef.current     = Array(9).fill('');
+    currentTurnRef.current = 'X';
+    setBoardView(Array(9).fill(''));
+    setCurrentPlayer('X');
     setWinningLine(null);
-    setCurrentPlayer("X");
-  };
+  }
 
-  const handleMove = (index, player, isLocal) => {
-    setBoard(prev => {
-      const newBoard = [...prev];
-      if (newBoard[index] === "") {
-        newBoard[index] = player;
-        checkWinner(newBoard, player, isLocal);
-      }
-      return newBoard;
-    });
-  };
+  function applyMove(index, player) {
+    const newBoard = [...boardRef.current];
+    if (newBoard[index] !== '') return;
+    newBoard[index] = player;
+    boardRef.current = newBoard;
+    setBoardView([...newBoard]);
+    checkWinner(newBoard, player);
+  }
 
-  const checkWinner = (currentBoard, lastPlayerMoved, isLocal) => {
-    let roundWon = false;
-    let winCond = null;
-
-    for (let i = 0; i < WIN_CONDITIONS.length; i++) {
-      const [a, b, c] = WIN_CONDITIONS[i];
+  function checkWinner(currentBoard, lastPlayer) {
+    for (const [a, b, c] of WIN_CONDITIONS) {
       if (currentBoard[a] && currentBoard[a] === currentBoard[b] && currentBoard[a] === currentBoard[c]) {
-        roundWon = true;
-        winCond = WIN_CONDITIONS[i];
-        break;
+        gameActiveRef.current = false;
+        calcWinningLine([a, b, c]);
+        setTimeout(() => {
+          setGameOverText({
+            title: 'Game Over',
+            desc:  lastPlayer === myRoleRef.current ? 'Victory! 🎉' : 'Defeat! 😢',
+            className: 'mb-4 fw-bold',
+          });
+          setOverlayState('disconnect');
+          overlayRef.current = 'disconnect';
+          resetBoardState();
+        }, 3000);
+        return;
       }
     }
-
-    if (roundWon) {
-      setGameActive(false);
-      calculateWinningLine(winCond);
-      
+    if (!currentBoard.includes('')) {
+      gameActiveRef.current = false;
       setTimeout(() => {
-        setGameOverText({
-          title: "Game Over",
-          desc: lastPlayerMoved === myRole ? "Victory!" : "Defeat!",
-          className: "mb-4 fw-bold"
-        });
+        setGameOverText({ title: 'Game Over', desc: "It's a tie!", className: 'mb-4 fw-bold' });
         setOverlayState('disconnect');
+        overlayRef.current = 'disconnect';
         resetBoardState();
       }, 3000);
-    } else if (!currentBoard.includes("")) {
-      setGameActive(false);
-      setTimeout(() => {
-        setGameOverText({
-          title: "Game Over",
-          desc: "It was a tie!",
-          className: "mb-4 fw-bold"
-        });
-        setOverlayState('disconnect');
-        resetBoardState();
-      }, 3000);
-    } else {
-      setCurrentPlayer(prev => prev === "X" ? "O" : "X");
+      return;
     }
-  };
+    const next = lastPlayer === 'X' ? 'O' : 'X';
+    currentTurnRef.current = next;
+    setCurrentPlayer(next);
+  }
 
-  const calculateWinningLine = (condition) => {
-    if (!boardRef.current || !cellRefs.current[condition[0]] || !cellRefs.current[condition[2]]) return;
+  function calcWinningLine(condition) {
+    if (!boardDomRef.current) return;
     const startCell = cellRefs.current[condition[0]];
-    const endCell = cellRefs.current[condition[2]];
-    const boardRect = boardRef.current.getBoundingClientRect();
-    const startRect = startCell.getBoundingClientRect();
-    const endRect = endCell.getBoundingClientRect();
+    const endCell   = cellRefs.current[condition[2]];
+    if (!startCell || !endCell) return;
+    const boardRect = boardDomRef.current.getBoundingClientRect();
+    const sRect = startCell.getBoundingClientRect();
+    const eRect = endCell.getBoundingClientRect();
+    const sx = sRect.left + sRect.width / 2  - boardRect.left;
+    const sy = sRect.top  + sRect.height / 2 - boardRect.top;
+    const ex = eRect.left + eRect.width / 2  - boardRect.left;
+    const ey = eRect.top  + eRect.height / 2 - boardRect.top;
+    const length = Math.sqrt((ex - sx) ** 2 + (ey - sy) ** 2);
+    const angle  = Math.atan2(ey - sy, ex - sx) * 180 / Math.PI;
+    setWinningLine({ condition, length, angle, sx, sy, player: currentTurnRef.current });
+  }
 
-    const startX = startRect.left + startRect.width / 2 - boardRect.left;
-    const startY = startRect.top + startRect.height / 2 - boardRect.top;
-    const endX = endRect.left + endRect.width / 2 - boardRect.left;
-    const endY = endRect.top + endRect.height / 2 - boardRect.top;
+  // -------------------------------------------------------
+  // USER ACTIONS
+  // -------------------------------------------------------
+  function onCellClick(index) {
+    if (!gameActiveRef.current) return;
+    if (currentTurnRef.current !== myRoleRef.current) return;
+    if (boardRef.current[index] !== '') return;
 
-    const length = Math.sqrt(Math.pow(endX - startX, 2) + Math.pow(endY - startY, 2));
-    const angle = Math.atan2(endY - startY, endX - startX) * 180 / Math.PI;
+    applyMove(index, myRoleRef.current);
+    clientRef.current.publish(roomIdRef.current, JSON.stringify({
+      type: 'MOVE', index, player: myRoleRef.current,
+    }));
+  }
 
-    setWinningLine({ condition, length, angle, startX, startY });
-  };
+  function joinGame() {
+    const nick = nicknameInput.trim();
+    if (!nick || !clientRef.current || !connected) return;
+    nicknameRef.current = nick;
+    overlayRef.current  = 'waiting';
+    setOverlayState('waiting');
+    startLooking();
+  }
 
-  const onCellClick = (index) => {
-    if (!gameActive || currentPlayer !== myRole || board[index] !== "") return;
-    handleMove(index, myRole, true);
-    if (client && roomId) {
-      client.publish(roomId, JSON.stringify({ type: 'MOVE', index, player: myRole }));
-    }
-  };
-
-  const joinGame = () => {
-    if (nickname.trim().length > 0 && client) {
-      setOverlayState('waiting');
-      setMyRole('X'); // Default to X (Host), will become O if acting as Guest
-      
-      // Publish intent to lobby
-      client.publish('xo-lobby-global-v1', JSON.stringify({
-        type: 'FIND_MATCH',
-        id: clientId,
-        nickname: nickname.trim()
+  function rejoinGame() {
+    // Notify room before leaving
+    if (clientRef.current && roomIdRef.current) {
+      clientRef.current.publish(roomIdRef.current, JSON.stringify({
+        type: 'LEAVE', player: myRoleRef.current,
       }));
+      clientRef.current.unsubscribe(roomIdRef.current);
+      roomIdRef.current = null;
     }
-  };
+    myRoleRef.current     = null;
+    gameActiveRef.current = false;
+    overlayRef.current    = 'waiting';
+    setOverlayState('waiting');
+    startLooking();
+  }
 
-  const rejoinGame = () => {
-    if (client && roomId) {
-      client.publish(roomId, JSON.stringify({ type: 'LEAVE', player: myRole }));
-      client.unsubscribe(roomId);
-      setRoomId(null);
-    }
-
-    if (nickname.trim().length > 0) {
-      joinGame();
-    } else {
-      setOverlayState('nickname');
-    }
-  };
+  // -------------------------------------------------------
+  // RENDER
+  // -------------------------------------------------------
+  const isMyTurn = gameActiveRef.current && currentPlayer === myRoleRef.current;
 
   return (
     <>
-      {/* Overlay: Nickname Entry */}
+      {/* Nickname Overlay */}
       {overlayState === 'nickname' && (
         <div className="overlay d-flex flex-column justify-content-center align-items-center">
           <div className="overlay-card text-center p-5 rounded-4 shadow-lg">
-            <h2 className="mb-4 fw-bold">Enter Your Nickname</h2>
-            <input 
-              type="text" 
-              value={nickname} 
-              onChange={e => setNickname(e.target.value)} 
-              className="form-control form-control-lg mb-3 text-center" 
-              placeholder="Player Name" 
-              maxLength="15" 
+            <h2 className="mb-2 fw-bold">
+              <span className="x-text">X</span><span className="o-text">O</span> Multiplayer
+            </h2>
+            <p className="text-muted mb-4">Enter your nickname to find a match</p>
+            <input
+              type="text"
+              value={nicknameInput}
+              onChange={e => setNicknameInput(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && joinGame()}
+              className="form-control form-control-lg mb-3 text-center"
+              placeholder="Your nickname"
+              maxLength="15"
             />
-            <button onClick={joinGame} className="btn btn-primary btn-lg rounded-pill px-5 fw-bold w-100">
-              {!client ? 'Connecting...' : 'Find Match'}
+            <button
+              onClick={joinGame}
+              disabled={!connected}
+              className="btn btn-primary btn-lg rounded-pill px-5 fw-bold w-100"
+            >
+              {connected ? 'Find Match 🎮' : 'Connecting...'}
             </button>
           </div>
         </div>
       )}
 
-      {/* Overlay: Waiting for Opponent */}
+      {/* Waiting Overlay */}
       {overlayState === 'waiting' && (
         <div className="overlay d-flex flex-column justify-content-center align-items-center">
           <div className="overlay-card text-center p-5 rounded-4 shadow-lg">
@@ -276,72 +319,73 @@ export default function Game() {
             <div className="spinner-border text-primary" style={{ width: '3rem', height: '3rem' }} role="status">
               <span className="visually-hidden">Loading...</span>
             </div>
-            <p className="mt-4 text-muted">We are matching you with another player.</p>
+            <p className="mt-4 text-muted">
+              Playing as <strong className="x-text">{nicknameInput}</strong>. Finding an opponent…
+            </p>
           </div>
         </div>
       )}
 
-      {/* Overlay: Game Over / Disconnected */}
+      {/* Game Over / Disconnect Overlay */}
       {overlayState === 'disconnect' && (
         <div className="overlay d-flex flex-column justify-content-center align-items-center">
           <div className="overlay-card text-center p-5 rounded-4 shadow-lg">
             <h2 className={gameOverText.className}>{gameOverText.title}</h2>
             <p className="mt-2 text-muted">{gameOverText.desc}</p>
-            <button onClick={rejoinGame} className="btn btn-danger btn-lg rounded-pill px-5 fw-bold mt-3">Find New Match</button>
+            <button onClick={rejoinGame} className="btn btn-danger btn-lg rounded-pill px-5 fw-bold mt-3">
+              Find New Match
+            </button>
           </div>
         </div>
       )}
 
+      {/* Main Game */}
       <div className="container min-vh-100 d-flex flex-column justify-content-center align-items-center">
-        {/* Header Section */}
-        <div className="text-center mb-4 header-section">
-          <h1 className="display-3 fw-bold game-title">
+        <div className="text-center mb-4">
+          <h1 className="display-3 fw-bold">
             <span className="x-text">X</span><span className="o-text">O</span> Multiplayer
           </h1>
         </div>
 
         {/* Scoreboard */}
-        <div className="scoreboard d-flex justify-content-between align-items-center mb-4 px-4 py-2 rounded-pill shadow-sm w-100" style={{ maxWidth: '500px' }}>
-          <div className="score-item text-center">
-            <span className="score-label x-text fs-5">{players.X} {myRole === 'X' ? '(You)' : ''}</span>
-          </div>
-          <div className="score-item text-center mx-4">
-            <span className="score-label text-white fw-bold fs-4">VS</span>
-          </div>
-          <div className="score-item text-center">
-            <span className="score-label o-text fs-5">{players.O} {myRole === 'O' ? '(You)' : ''}</span>
-          </div>
+        <div className="scoreboard d-flex justify-content-between align-items-center mb-4 px-4 py-2 rounded-pill w-100" style={{ maxWidth: '500px' }}>
+          <span className="x-text fs-5 fw-semibold">
+            {players.X} {myRoleRef.current === 'X' ? '(You)' : ''}
+          </span>
+          <span className="text-white fw-bold fs-4">VS</span>
+          <span className="o-text fs-5 fw-semibold">
+            {players.O} {myRoleRef.current === 'O' ? '(You)' : ''}
+          </span>
         </div>
 
-        {/* Game Board */}
+        {/* Board */}
         <div className="board-container">
-          <div id="board" className="board" ref={boardRef}>
-            {board.map((cell, index) => {
+          <div className="board" ref={boardDomRef}>
+            {boardView.map((cell, index) => {
               const isWinCell = winningLine?.condition.includes(index);
               return (
-                <div 
+                <div
                   key={index}
                   ref={el => cellRefs.current[index] = el}
-                  className={`cell ${cell !== "" ? 'taken ' + cell.toLowerCase() : ''} ${isWinCell ? 'win-anim' : ''}`}
+                  className={`cell ${cell ? 'taken ' + cell.toLowerCase() : ''} ${isWinCell ? 'win-anim' : ''}`}
                   onClick={() => onCellClick(index)}
                 >
                   {cell}
                 </div>
               );
             })}
-            
-            {/* Winning Line */}
+
             {winningLine && (
-              <div 
+              <div
                 className="winning-line active"
                 style={{
-                  width: `${winningLine.length}px`,
-                  height: '6px',
-                  top: `${winningLine.startY - 3}px`,
-                  left: `${winningLine.startX}px`,
-                  transform: `rotate(${winningLine.angle}deg)`,
-                  backgroundColor: currentPlayer === "X" ? "var(--x-color)" : "var(--o-color)",
-                  boxShadow: currentPlayer === "X" ? "var(--x-shadow)" : "var(--o-shadow)"
+                  width:           `${winningLine.length}px`,
+                  height:          '6px',
+                  top:             `${winningLine.sy - 3}px`,
+                  left:            `${winningLine.sx}px`,
+                  transform:       `rotate(${winningLine.angle}deg)`,
+                  backgroundColor: winningLine.player === 'X' ? 'var(--x-color)' : 'var(--o-color)',
+                  boxShadow:       winningLine.player === 'X' ? 'var(--x-shadow)' : 'var(--o-shadow)',
                 }}
               />
             )}
@@ -351,11 +395,10 @@ export default function Game() {
         {/* Turn Indicator */}
         <div className="turn-indicator mt-4 mb-3">
           <h4 className="fw-semibold">
-            {!gameActive ? 'Waiting to start...' : 
-              currentPlayer === myRole ? 
-                `Your Turn (${myRole})` : 
-                `Opponent's Turn...`
-            }
+            {overlayState !== 'none' ? 'Waiting to start…' :
+              isMyTurn
+                ? <span>Your Turn <span className={myRoleRef.current === 'X' ? 'x-text' : 'o-text'}>({myRoleRef.current})</span></span>
+                : "Opponent's Turn…"}
           </h4>
         </div>
       </div>
