@@ -30,6 +30,7 @@ export default function Game() {
   // --- React state (only for re-renders) ---
   const [overlayState,  setOverlayState]  = useState('nickname');
   const [nicknameInput, setNicknameInput] = useState('');
+  const [myRole,        setMyRole]        = useState(null); // synced from ref for render
   const [players,       setPlayers]       = useState({ X: 'Player X', O: 'Player O' });
   const [boardView,     setBoardView]     = useState(Array(9).fill(''));
   const [currentPlayer, setCurrentPlayer] = useState('X');
@@ -53,11 +54,16 @@ export default function Game() {
       console.log('MQTT connected:', id);
       mqttClient.subscribe(LOBBY_TOPIC);
       setConnected(true);
+      // Re-subscribe to room if reconnected mid-game
+      if (roomIdRef.current) {
+        mqttClient.subscribe(roomIdRef.current);
+      }
     });
 
     mqttClient.on('message', handleMessage);
 
-    mqttClient.on('disconnect', () => setConnected(false));
+    mqttClient.on('offline', () => setConnected(false));
+    mqttClient.on('close',   () => setConnected(false));
 
     clientRef.current = mqttClient;
 
@@ -139,6 +145,7 @@ export default function Game() {
         roomIdRef.current  = data.roomId;
 
         clientRef.current.subscribe(data.roomId);
+        setMyRole(role); // sync to state for renders
         setPlayers({ X: data.hostNick, O: data.guestNick });
         setOverlayState('none');
         overlayRef.current = 'none';
@@ -279,7 +286,7 @@ export default function Game() {
   // -------------------------------------------------------
   // RENDER
   // -------------------------------------------------------
-  const isMyTurn = gameActiveRef.current && currentPlayer === myRoleRef.current;
+  const isMyTurn = overlayState === 'none' && currentPlayer === myRole;
 
   return (
     <>
@@ -350,11 +357,11 @@ export default function Game() {
         {/* Scoreboard */}
         <div className="scoreboard d-flex justify-content-between align-items-center mb-4 px-4 py-2 rounded-pill w-100" style={{ maxWidth: '500px' }}>
           <span className="x-text fs-5 fw-semibold">
-            {players.X} {myRoleRef.current === 'X' ? '(You)' : ''}
+            {players.X} {myRole === 'X' ? '(You)' : ''}
           </span>
           <span className="text-white fw-bold fs-4">VS</span>
           <span className="o-text fs-5 fw-semibold">
-            {players.O} {myRoleRef.current === 'O' ? '(You)' : ''}
+            {players.O} {myRole === 'O' ? '(You)' : ''}
           </span>
         </div>
 
@@ -397,7 +404,7 @@ export default function Game() {
           <h4 className="fw-semibold">
             {overlayState !== 'none' ? 'Waiting to start…' :
               isMyTurn
-                ? <span>Your Turn <span className={myRoleRef.current === 'X' ? 'x-text' : 'o-text'}>({myRoleRef.current})</span></span>
+                ? <span>Your Turn <span className={myRole === 'X' ? 'x-text' : 'o-text'}>({myRole})</span></span>
                 : "Opponent's Turn…"}
           </h4>
         </div>
