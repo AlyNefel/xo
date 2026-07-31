@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useState, useRef } from 'react';
-import io from 'socket.io-client';
+import mqtt from 'mqtt';
 
 const WIN_CONDITIONS = [
   [0, 1, 2], [3, 4, 5], [6, 7, 8],
@@ -9,7 +9,8 @@ const WIN_CONDITIONS = [
 ];
 
 export default function Game() {
-  const [socket, setSocket] = useState(null);
+  const [client, setClient] = useState(null);
+  const [clientId, setClientId] = useState('');
   
   // UI States
   const [nickname, setNickname] = useState('');
@@ -21,53 +22,120 @@ export default function Game() {
   const [myRole, setMyRole] = useState(null); // 'X' or 'O'
   const [gameActive, setGameActive] = useState(false);
   const [players, setPlayers] = useState({ X: 'Player X', O: 'Player O' });
-  const [winningLine, setWinningLine] = useState(null); // { condition, length, angle, startX, startY }
+  const [winningLine, setWinningLine] = useState(null);
   const [gameOverText, setGameOverText] = useState({ title: '', desc: '', className: '' });
+  
+  const [roomId, setRoomId] = useState(null);
 
   const boardRef = useRef(null);
   const cellRefs = useRef([]);
 
+  // Connect to MQTT Broker on load
   useEffect(() => {
-    const newSocket = io();
-    setSocket(newSocket);
+    const id = 'xo_player_' + Math.random().toString(16).substring(2, 10);
+    setClientId(id);
 
-    newSocket.on('waiting_for_opponent', () => {
-      setOverlayState('waiting');
+    // Free public MQTT broker over WebSockets
+    const mqttClient = mqtt.connect('wss://broker.emqx.io:8084/mqtt', {
+      clientId: id,
+      clean: true,
+      connectTimeout: 4000,
+      reconnectPeriod: 1000,
     });
 
-    newSocket.on('role_assigned', (role) => {
-      setMyRole(role);
+    mqttClient.on('connect', () => {
+      console.log('Connected to MQTT');
+      mqttClient.subscribe('xo-lobby-global-v1');
     });
 
-    newSocket.on('game_start', (data) => {
-      setOverlayState('none');
-      setPlayers({ X: data.playerX, O: data.playerO });
-      setCurrentPlayer(data.startingTurn);
-      setGameActive(true);
-      resetBoardState();
-    });
+    setClient(mqttClient);
 
-    newSocket.on('opponent_moved', (data) => {
-      handleMove(data.index, data.player, false);
-    });
-
-    newSocket.on('opponent_disconnected', () => {
-      setGameActive(false);
-      setGameOverText({
-        title: "Opponent Disconnected",
-        desc: "The other player has left the game.",
-        className: "mb-4 fw-bold text-danger"
-      });
-      setOverlayState('disconnect');
-      resetBoardState();
-    });
-
-    return () => newSocket.close();
+    return () => {
+      mqttClient.end();
+    };
   }, []);
+
+  // Handle incoming messages
+  useEffect(() => {
+    if (!client) return;
+
+    const handleMessage = (topic, message) => {
+      const data = JSON.parse(message.toString());
+      
+      if (topic === 'xo-lobby-global-v1') {
+        // I am waiting for a match, someone else wants to play
+        if (data.type === 'FIND_MATCH' && data.id !== clientId && overlayState === 'waiting') {
+          // I will be the Host
+          const newRoomId = 'xo_room_' + Math.random().toString(16).substring(2, 10);
+          client.subscribe(newRoomId);
+          client.publish('xo-lobby-global-v1', JSON.stringify({
+            type: 'MATCH_FOUND',
+            hostId: clientId,
+            guestId: data.id,
+            roomId: newRoomId,
+            hostNickname: nickname
+          }));
+        }
+        
+        // Someone found a match for me (I am the Guest)
+        if (data.type === 'MATCH_FOUND' && data.guestId === clientId && overlayState === 'waiting') {
+          client.subscribe(data.roomId);
+          setRoomId(data.roomId);
+          setMyRole('O');
+          setPlayers({ X: data.hostNickname, O: nickname });
+          setOverlayState('none');
+          setGameActive(true);
+          resetBoardState();
+          
+          client.publish(data.roomId, JSON.stringify({
+            type: 'GAME_START',
+            guestNickname: nickname
+          }));
+        }
+      }
+
+      // Room-specific messages
+      if (topic === roomId) {
+        if (data.type === 'GAME_START' && myRole === 'X') {
+          setPlayers(prev => ({ ...prev, O: data.guestNickname }));
+          setOverlayState('none');
+          setGameActive(true);
+          resetBoardState();
+        }
+
+        if (data.type === 'MOVE' && data.player !== myRole) {
+          handleMove(data.index, data.player, false);
+        }
+
+        if (data.type === 'LEAVE' && data.player !== myRole) {
+          handleOpponentDisconnect();
+        }
+      }
+    };
+
+    client.on('message', handleMessage);
+    return () => client.removeListener('message', handleMessage);
+  }, [client, clientId, overlayState, nickname, roomId, myRole]);
+
+  const handleOpponentDisconnect = () => {
+    setGameActive(false);
+    setGameOverText({
+      title: "Opponent Disconnected",
+      desc: "The other player has left the game.",
+      className: "mb-4 fw-bold text-danger"
+    });
+    setOverlayState('disconnect');
+    resetBoardState();
+    if (client && roomId) {
+      client.unsubscribe(roomId);
+      setRoomId(null);
+    }
+  };
 
   const resetBoardState = () => {
     setBoard(Array(9).fill(""));
     setWinningLine(null);
+    setCurrentPlayer("X");
   };
 
   const handleMove = (index, player, isLocal) => {
@@ -125,10 +193,8 @@ export default function Game() {
 
   const calculateWinningLine = (condition) => {
     if (!boardRef.current || !cellRefs.current[condition[0]] || !cellRefs.current[condition[2]]) return;
-
     const startCell = cellRefs.current[condition[0]];
     const endCell = cellRefs.current[condition[2]];
-    
     const boardRect = boardRef.current.getBoundingClientRect();
     const startRect = startCell.getBoundingClientRect();
     const endRect = endCell.getBoundingClientRect();
@@ -147,19 +213,34 @@ export default function Game() {
   const onCellClick = (index) => {
     if (!gameActive || currentPlayer !== myRole || board[index] !== "") return;
     handleMove(index, myRole, true);
-    socket.emit('make_move', { index, player: myRole });
+    if (client && roomId) {
+      client.publish(roomId, JSON.stringify({ type: 'MOVE', index, player: myRole }));
+    }
   };
 
   const joinGame = () => {
-    if (nickname.trim().length > 0) {
-      socket.emit('join_game', nickname.trim());
+    if (nickname.trim().length > 0 && client) {
+      setOverlayState('waiting');
+      setMyRole('X'); // Default to X (Host), will become O if acting as Guest
+      
+      // Publish intent to lobby
+      client.publish('xo-lobby-global-v1', JSON.stringify({
+        type: 'FIND_MATCH',
+        id: clientId,
+        nickname: nickname.trim()
+      }));
     }
   };
 
   const rejoinGame = () => {
+    if (client && roomId) {
+      client.publish(roomId, JSON.stringify({ type: 'LEAVE', player: myRole }));
+      client.unsubscribe(roomId);
+      setRoomId(null);
+    }
+
     if (nickname.trim().length > 0) {
-      setOverlayState('waiting');
-      socket.emit('join_game', nickname.trim());
+      joinGame();
     } else {
       setOverlayState('nickname');
     }
@@ -180,7 +261,9 @@ export default function Game() {
               placeholder="Player Name" 
               maxLength="15" 
             />
-            <button onClick={joinGame} className="btn btn-primary btn-lg rounded-pill px-5 fw-bold w-100">Find Match</button>
+            <button onClick={joinGame} className="btn btn-primary btn-lg rounded-pill px-5 fw-bold w-100">
+              {!client ? 'Connecting...' : 'Find Match'}
+            </button>
           </div>
         </div>
       )}
