@@ -8,15 +8,15 @@ const WIN_CONDITIONS = [
   [0, 4, 8], [2, 4, 6]
 ];
 
-const LOBBY_TOPIC = 'xo-game-lobby-v3';
+const LOBBY_TOPIC = 'xo-game-lobby-v4';
 const BROKER_URL  = 'wss://broker.emqx.io:8084/mqtt';
 
 export default function Game() {
-  // --- Refs (stable across renders, no re-subscribe cycles) ---
+  // ─── Refs (never cause stale closures in message handler) ───
   const clientRef      = useRef(null);
   const clientIdRef    = useRef('');
   const nicknameRef    = useRef('');
-  const overlayRef     = useRef('nickname');
+  const overlayRef     = useRef('nickname');  // mirrors overlayState
   const myRoleRef      = useRef(null);
   const roomIdRef      = useRef(null);
   const boardRef       = useRef(Array(9).fill(''));
@@ -25,12 +25,12 @@ export default function Game() {
   const intervalRef    = useRef(null);
   const boardDomRef    = useRef(null);
   const cellRefs       = useRef([]);
-  const matchedRef     = useRef(false);  // prevent double-matching
+  const matchedRef     = useRef(false);  // guards against double-pairing
 
-  // --- React state (only for re-renders) ---
+  // ─── React state (drives re-renders) ───
   const [overlayState,  setOverlayState]  = useState('nickname');
   const [nicknameInput, setNicknameInput] = useState('');
-  const [myRole,        setMyRole]        = useState(null); // synced from ref for render
+  const [myRole,        setMyRole]        = useState(null);
   const [players,       setPlayers]       = useState({ X: 'Player X', O: 'Player O' });
   const [boardView,     setBoardView]     = useState(Array(9).fill(''));
   const [currentPlayer, setCurrentPlayer] = useState('X');
@@ -38,44 +38,39 @@ export default function Game() {
   const [gameOverText,  setGameOverText]  = useState({ title: '', desc: '', className: '' });
   const [connected,     setConnected]     = useState(false);
 
-  // --- Connect MQTT once ---
+  // ─── Connect MQTT once on mount ───
   useEffect(() => {
     const id = 'xo_' + Math.random().toString(16).substring(2, 12);
     clientIdRef.current = id;
 
-    const mqttClient = mqtt.connect(BROKER_URL, {
+    const mc = mqtt.connect(BROKER_URL, {
       clientId: id,
       clean: true,
-      connectTimeout: 6000,
+      connectTimeout: 8000,
       reconnectPeriod: 2000,
     });
 
-    mqttClient.on('connect', () => {
-      console.log('MQTT connected:', id);
-      mqttClient.subscribe(LOBBY_TOPIC);
+    mc.on('connect', () => {
+      console.log('[MQTT] connected as', id);
+      mc.subscribe(LOBBY_TOPIC);
       setConnected(true);
-      // Re-subscribe to room if reconnected mid-game
-      if (roomIdRef.current) {
-        mqttClient.subscribe(roomIdRef.current);
-      }
+      // Re-subscribe to room on reconnect
+      if (roomIdRef.current) mc.subscribe(roomIdRef.current);
     });
 
-    mqttClient.on('message', handleMessage);
+    mc.on('offline', () => setConnected(false));
+    mc.on('close',   () => setConnected(false));
 
-    mqttClient.on('offline', () => setConnected(false));
-    mqttClient.on('close',   () => setConnected(false));
+    mc.on('message', onMessage);
 
-    clientRef.current = mqttClient;
+    clientRef.current = mc;
+    return () => { stopLooking(); mc.end(); };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-    return () => {
-      stopLooking();
-      mqttClient.end();
-    };
-  }, []);
+  // ═══════════════════════════════════════════════
+  //  MATCHMAKING HELPERS
+  // ═══════════════════════════════════════════════
 
-  // -------------------------------------------------------
-  // MATCHMAKING
-  // -------------------------------------------------------
   function startLooking() {
     matchedRef.current = false;
     broadcastFindMatch();
@@ -98,64 +93,80 @@ export default function Game() {
     }));
   }
 
-  // -------------------------------------------------------
-  // MESSAGE HANDLER (stable ref – registered once)
-  // -------------------------------------------------------
-  function handleMessage(topic, rawMsg) {
+  // Shared helper to start the game for either player
+  function startGame(role, roomId, playerX, playerO) {
+    myRoleRef.current    = role;
+    roomIdRef.current    = roomId;
+    gameActiveRef.current = true;
+    overlayRef.current   = 'none';
+
+    setMyRole(role);
+    setPlayers({ X: playerX, O: playerO });
+    setOverlayState('none');
+    resetBoardState();
+  }
+
+  // ═══════════════════════════════════════════════
+  //  MQTT MESSAGE HANDLER  (stable – registered once)
+  // ═══════════════════════════════════════════════
+
+  function onMessage(topic, rawMsg) {
     let data;
     try { data = JSON.parse(rawMsg.toString()); } catch { return; }
 
-    // ---- LOBBY ----
+    // ── LOBBY messages ──────────────────────────────────────────
     if (topic === LOBBY_TOPIC) {
 
-      if (data.type === 'FIND_MATCH' && data.id !== clientIdRef.current && overlayRef.current === 'waiting') {
-        // Deterministic host selection: alphabetically higher ID = host (X)
+      // Someone is looking for a match
+      if (
+        data.type === 'FIND_MATCH' &&
+        data.id   !== clientIdRef.current &&
+        overlayRef.current === 'waiting' &&
+        !matchedRef.current
+      ) {
+        // Deterministic: alphabetically higher clientId becomes Host (X)
         const iAmHost = clientIdRef.current > data.id;
-        if (!iAmHost) return; // guest side: wait for host to declare MATCH_FOUND
+        if (!iAmHost) return; // Guest waits for MATCH_FOUND
 
-        if (matchedRef.current) return;
+        // ── I AM THE HOST – start MY game immediately ──────────
         matchedRef.current = true;
         stopLooking();
 
         const newRoomId = 'xo_room_' + Math.random().toString(16).substring(2, 10);
-        roomIdRef.current = newRoomId;
         clientRef.current.subscribe(newRoomId);
 
-        // Tell both players (including myself via lobby echo)
+        // Start host's own game right now (don't rely on MQTT echo)
+        startGame('X', newRoomId, nicknameRef.current, data.nick);
+
+        // Notify guest via lobby
         clientRef.current.publish(LOBBY_TOPIC, JSON.stringify({
-          type: 'MATCH_FOUND',
-          hostId:   clientIdRef.current,
-          guestId:  data.id,
-          roomId:   newRoomId,
-          hostNick: nicknameRef.current,
+          type:      'MATCH_FOUND',
+          hostId:    clientIdRef.current,
+          guestId:   data.id,
+          roomId:    newRoomId,
+          hostNick:  nicknameRef.current,
           guestNick: data.nick,
         }));
       }
 
-      if (data.type === 'MATCH_FOUND') {
-        const amHost  = data.hostId  === clientIdRef.current;
-        const amGuest = data.guestId === clientIdRef.current;
-        if ((!amHost && !amGuest) || matchedRef.current) return;
-
+      // MATCH_FOUND – only the designated guest processes this
+      if (
+        data.type     === 'MATCH_FOUND' &&
+        data.guestId  === clientIdRef.current &&
+        overlayRef.current === 'waiting' &&
+        !matchedRef.current
+      ) {
         matchedRef.current = true;
         stopLooking();
 
-        const role = amHost ? 'X' : 'O';
-        myRoleRef.current  = role;
-        roomIdRef.current  = data.roomId;
-
         clientRef.current.subscribe(data.roomId);
-        setMyRole(role); // sync to state for renders
-        setPlayers({ X: data.hostNick, O: data.guestNick });
-        setOverlayState('none');
-        overlayRef.current = 'none';
-        resetBoardState();
-        gameActiveRef.current = true;
+        // Start guest's game
+        startGame('O', data.roomId, data.hostNick, data.guestNick);
       }
     }
 
-    // ---- ROOM ----
-    if (topic === roomIdRef.current) {
+    // ── ROOM messages ───────────────────────────────────────────
+    if (roomIdRef.current && topic === roomIdRef.current) {
       if (data.type === 'MOVE' && data.player !== myRoleRef.current && gameActiveRef.current) {
         applyMove(data.index, data.player);
       }
@@ -163,22 +174,23 @@ export default function Game() {
       if (data.type === 'LEAVE') {
         gameActiveRef.current = false;
         setGameOverText({
-          title: 'Opponent Disconnected',
-          desc:  'The other player has left the game.',
+          title:     'Opponent Disconnected',
+          desc:      'The other player has left the game.',
           className: 'mb-4 fw-bold text-danger',
         });
-        setOverlayState('disconnect');
         overlayRef.current = 'disconnect';
+        setOverlayState('disconnect');
         resetBoardState();
       }
     }
   }
 
-  // -------------------------------------------------------
-  // BOARD LOGIC
-  // -------------------------------------------------------
+  // ═══════════════════════════════════════════════
+  //  BOARD LOGIC
+  // ═══════════════════════════════════════════════
+
   function resetBoardState() {
-    boardRef.current     = Array(9).fill('');
+    boardRef.current       = Array(9).fill('');
     currentTurnRef.current = 'X';
     setBoardView(Array(9).fill(''));
     setCurrentPlayer('X');
@@ -194,30 +206,30 @@ export default function Game() {
     checkWinner(newBoard, player);
   }
 
-  function checkWinner(currentBoard, lastPlayer) {
+  function checkWinner(board, lastPlayer) {
     for (const [a, b, c] of WIN_CONDITIONS) {
-      if (currentBoard[a] && currentBoard[a] === currentBoard[b] && currentBoard[a] === currentBoard[c]) {
+      if (board[a] && board[a] === board[b] && board[a] === board[c]) {
         gameActiveRef.current = false;
-        calcWinningLine([a, b, c]);
+        calcWinningLine([a, b, c], lastPlayer);
         setTimeout(() => {
           setGameOverText({
-            title: 'Game Over',
-            desc:  lastPlayer === myRoleRef.current ? 'Victory! 🎉' : 'Defeat! 😢',
+            title:     'Game Over',
+            desc:      lastPlayer === myRoleRef.current ? 'Victory! 🎉' : 'Defeat! 😢',
             className: 'mb-4 fw-bold',
           });
-          setOverlayState('disconnect');
           overlayRef.current = 'disconnect';
+          setOverlayState('disconnect');
           resetBoardState();
         }, 3000);
         return;
       }
     }
-    if (!currentBoard.includes('')) {
+    if (!board.includes('')) {
       gameActiveRef.current = false;
       setTimeout(() => {
         setGameOverText({ title: 'Game Over', desc: "It's a tie!", className: 'mb-4 fw-bold' });
-        setOverlayState('disconnect');
         overlayRef.current = 'disconnect';
+        setOverlayState('disconnect');
         resetBoardState();
       }, 3000);
       return;
@@ -227,26 +239,31 @@ export default function Game() {
     setCurrentPlayer(next);
   }
 
-  function calcWinningLine(condition) {
+  function calcWinningLine(condition, winnerPlayer) {
     if (!boardDomRef.current) return;
-    const startCell = cellRefs.current[condition[0]];
-    const endCell   = cellRefs.current[condition[2]];
-    if (!startCell || !endCell) return;
-    const boardRect = boardDomRef.current.getBoundingClientRect();
-    const sRect = startCell.getBoundingClientRect();
-    const eRect = endCell.getBoundingClientRect();
-    const sx = sRect.left + sRect.width / 2  - boardRect.left;
-    const sy = sRect.top  + sRect.height / 2 - boardRect.top;
-    const ex = eRect.left + eRect.width / 2  - boardRect.left;
-    const ey = eRect.top  + eRect.height / 2 - boardRect.top;
-    const length = Math.sqrt((ex - sx) ** 2 + (ey - sy) ** 2);
-    const angle  = Math.atan2(ey - sy, ex - sx) * 180 / Math.PI;
-    setWinningLine({ condition, length, angle, sx, sy, player: currentTurnRef.current });
+    const s = cellRefs.current[condition[0]];
+    const e = cellRefs.current[condition[2]];
+    if (!s || !e) return;
+    const br = boardDomRef.current.getBoundingClientRect();
+    const sr = s.getBoundingClientRect();
+    const er = e.getBoundingClientRect();
+    const sx = sr.left + sr.width  / 2 - br.left;
+    const sy = sr.top  + sr.height / 2 - br.top;
+    const ex = er.left + er.width  / 2 - br.left;
+    const ey = er.top  + er.height / 2 - br.top;
+    setWinningLine({
+      condition,
+      length: Math.sqrt((ex - sx) ** 2 + (ey - sy) ** 2),
+      angle:  Math.atan2(ey - sy, ex - sx) * 180 / Math.PI,
+      sx, sy,
+      player: winnerPlayer,
+    });
   }
 
-  // -------------------------------------------------------
-  // USER ACTIONS
-  // -------------------------------------------------------
+  // ═══════════════════════════════════════════════
+  //  USER ACTIONS
+  // ═══════════════════════════════════════════════
+
   function onCellClick(index) {
     if (!gameActiveRef.current) return;
     if (currentTurnRef.current !== myRoleRef.current) return;
@@ -260,7 +277,7 @@ export default function Game() {
 
   function joinGame() {
     const nick = nicknameInput.trim();
-    if (!nick || !clientRef.current || !connected) return;
+    if (!nick || !connected) return;
     nicknameRef.current = nick;
     overlayRef.current  = 'waiting';
     setOverlayState('waiting');
@@ -268,29 +285,30 @@ export default function Game() {
   }
 
   function rejoinGame() {
-    // Notify room before leaving
     if (clientRef.current && roomIdRef.current) {
       clientRef.current.publish(roomIdRef.current, JSON.stringify({
         type: 'LEAVE', player: myRoleRef.current,
       }));
       clientRef.current.unsubscribe(roomIdRef.current);
-      roomIdRef.current = null;
     }
-    myRoleRef.current     = null;
+    roomIdRef.current    = null;
+    myRoleRef.current    = null;
     gameActiveRef.current = false;
-    overlayRef.current    = 'waiting';
+    setMyRole(null);
+    overlayRef.current   = 'waiting';
     setOverlayState('waiting');
     startLooking();
   }
 
-  // -------------------------------------------------------
-  // RENDER
-  // -------------------------------------------------------
+  // ═══════════════════════════════════════════════
+  //  RENDER
+  // ═══════════════════════════════════════════════
+
   const isMyTurn = overlayState === 'none' && currentPlayer === myRole;
 
   return (
     <>
-      {/* Nickname Overlay */}
+      {/* ── Nickname Overlay ── */}
       {overlayState === 'nickname' && (
         <div className="overlay d-flex flex-column justify-content-center align-items-center">
           <div className="overlay-card text-center p-5 rounded-4 shadow-lg">
@@ -306,25 +324,31 @@ export default function Game() {
               className="form-control form-control-lg mb-3 text-center"
               placeholder="Your nickname"
               maxLength="15"
+              id="nickname-input"
             />
             <button
+              id="btn-find-match"
               onClick={joinGame}
               disabled={!connected}
               className="btn btn-primary btn-lg rounded-pill px-5 fw-bold w-100"
             >
-              {connected ? 'Find Match 🎮' : 'Connecting...'}
+              {connected ? 'Find Match 🎮' : 'Connecting…'}
             </button>
           </div>
         </div>
       )}
 
-      {/* Waiting Overlay */}
+      {/* ── Waiting Overlay ── */}
       {overlayState === 'waiting' && (
         <div className="overlay d-flex flex-column justify-content-center align-items-center">
           <div className="overlay-card text-center p-5 rounded-4 shadow-lg">
-            <h2 className="mb-4 fw-bold">Waiting for opponent...</h2>
-            <div className="spinner-border text-primary" style={{ width: '3rem', height: '3rem' }} role="status">
-              <span className="visually-hidden">Loading...</span>
+            <h2 className="mb-4 fw-bold">Waiting for opponent…</h2>
+            <div
+              className="spinner-border text-primary"
+              style={{ width: '3rem', height: '3rem' }}
+              role="status"
+            >
+              <span className="visually-hidden">Loading…</span>
             </div>
             <p className="mt-4 text-muted">
               Playing as <strong className="x-text">{nicknameInput}</strong>. Finding an opponent…
@@ -333,20 +357,24 @@ export default function Game() {
         </div>
       )}
 
-      {/* Game Over / Disconnect Overlay */}
+      {/* ── Game Over / Disconnect Overlay ── */}
       {overlayState === 'disconnect' && (
         <div className="overlay d-flex flex-column justify-content-center align-items-center">
           <div className="overlay-card text-center p-5 rounded-4 shadow-lg">
             <h2 className={gameOverText.className}>{gameOverText.title}</h2>
             <p className="mt-2 text-muted">{gameOverText.desc}</p>
-            <button onClick={rejoinGame} className="btn btn-danger btn-lg rounded-pill px-5 fw-bold mt-3">
+            <button
+              id="btn-rejoin"
+              onClick={rejoinGame}
+              className="btn btn-danger btn-lg rounded-pill px-5 fw-bold mt-3"
+            >
               Find New Match
             </button>
           </div>
         </div>
       )}
 
-      {/* Main Game */}
+      {/* ── Main Game ── */}
       <div className="container min-vh-100 d-flex flex-column justify-content-center align-items-center">
         <div className="text-center mb-4">
           <h1 className="display-3 fw-bold">
@@ -355,13 +383,16 @@ export default function Game() {
         </div>
 
         {/* Scoreboard */}
-        <div className="scoreboard d-flex justify-content-between align-items-center mb-4 px-4 py-2 rounded-pill w-100" style={{ maxWidth: '500px' }}>
+        <div
+          className="scoreboard d-flex justify-content-between align-items-center mb-4 px-4 py-2 rounded-pill w-100"
+          style={{ maxWidth: '500px' }}
+        >
           <span className="x-text fs-5 fw-semibold">
-            {players.X} {myRole === 'X' ? '(You)' : ''}
+            {players.X}{myRole === 'X' ? ' (You)' : ''}
           </span>
           <span className="text-white fw-bold fs-4">VS</span>
           <span className="o-text fs-5 fw-semibold">
-            {players.O} {myRole === 'O' ? '(You)' : ''}
+            {players.O}{myRole === 'O' ? ' (You)' : ''}
           </span>
         </div>
 
@@ -373,8 +404,12 @@ export default function Game() {
               return (
                 <div
                   key={index}
-                  ref={el => cellRefs.current[index] = el}
-                  className={`cell ${cell ? 'taken ' + cell.toLowerCase() : ''} ${isWinCell ? 'win-anim' : ''}`}
+                  ref={el => { cellRefs.current[index] = el; }}
+                  className={[
+                    'cell',
+                    cell ? 'taken ' + cell.toLowerCase() : '',
+                    isWinCell ? 'win-anim' : '',
+                  ].join(' ')}
                   onClick={() => onCellClick(index)}
                 >
                   {cell}
@@ -402,10 +437,12 @@ export default function Game() {
         {/* Turn Indicator */}
         <div className="turn-indicator mt-4 mb-3">
           <h4 className="fw-semibold">
-            {overlayState !== 'none' ? 'Waiting to start…' :
-              isMyTurn
-                ? <span>Your Turn <span className={myRole === 'X' ? 'x-text' : 'o-text'}>({myRole})</span></span>
-                : "Opponent's Turn…"}
+            {overlayState !== 'none'
+              ? 'Waiting to start…'
+              : isMyTurn
+                ? <span>Your Turn{' '}<span className={myRole === 'X' ? 'x-text' : 'o-text'}>({myRole})</span></span>
+                : "Opponent's Turn…"
+            }
           </h4>
         </div>
       </div>
